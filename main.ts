@@ -1,0 +1,469 @@
+import {
+	App,
+	Plugin,
+	PluginSettingTab,
+	Setting,
+	Notice,
+	requestUrl,
+	RequestUrlParam,
+	TFile,
+} from "obsidian";
+
+interface GDriveSettings {
+	clientId: string;
+	clientSecret: string;
+	refreshToken: string;
+	driveFolderName: string;
+	autoSyncInterval: number;
+	autoSyncOnStart: boolean;
+}
+
+interface DriveFileInfo {
+	id: string;
+	modifiedTime: string;
+}
+
+const DEFAULT_SETTINGS: GDriveSettings = {
+	clientId: "",
+	clientSecret: "",
+	refreshToken: "",
+	driveFolderName: "ObsidianVaultSync",
+	autoSyncInterval: 30,
+	autoSyncOnStart: true,
+};
+
+export default class GDriveVaultSync extends Plugin {
+	settings: GDriveSettings;
+
+	private accessToken: string = "";
+	private tokenExpiry: number = 0;
+	private driveFolderId: string = "";
+	private isSyncing: boolean = false;
+	private syncIntervalId: number | null = null;
+	private lastSynced: Record<string, number> = {};
+	private statusBarEl: HTMLElement | null = null;
+
+	async onload() {
+		try {
+			await this.loadSettings();
+			this.lastSynced = (await this.loadData())?.lastSynced ?? {};
+			this.statusBarEl = this.addStatusBarItem();
+			this.setStatus("idle");
+			this.addSettingTab(new GDriveSyncSettingTab(this.app, this));
+			this.addCommand({ id: "gdrive-full-sync", name: "Two-Way Sync Now", callback: () => this.fullTwoWaySync() });
+			this.addCommand({ id: "gdrive-download-all", name: "Download All from Drive", callback: () => this.downloadAllFromDrive() });
+			this.registerEvent(this.app.vault.on("modify", (file) => {
+				if (file instanceof TFile && this.hasCredentials()) this.onFileModified(file);
+			}));
+			this.registerEvent(this.app.vault.on("create", (file) => {
+				if (file instanceof TFile && this.hasCredentials()) this.onFileCreated(file);
+			}));
+			this.registerEvent(this.app.vault.on("delete", (file) => {
+				if (file instanceof TFile && this.hasCredentials()) this.onFileDeleted(file);
+			}));
+			this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+				if (file instanceof TFile && this.hasCredentials()) this.onFileRenamed(file, oldPath);
+			}));
+			window.setTimeout(() => { this.silentUpdateCheck(); }, 10000);
+			if (this.settings.autoSyncOnStart && this.hasCredentials()) {
+				window.setTimeout(() => { this.startAutoSync(); }, 5000);
+			}
+		} catch (e) {
+			console.error("[GDrive Sync] onload error:", this.errMsg(e));
+		}
+	}
+
+	async onunload() {
+		try { this.stopAutoSync(); await this.persistLastSynced(); }
+		catch (e) { console.error("[GDrive Sync] onunload error:", this.errMsg(e)); }
+	}
+
+	async loadSettings() {
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+	}
+	async saveSettings() {
+		await this.saveData(Object.assign({}, this.settings, { lastSynced: this.lastSynced }));
+	}
+	private async persistLastSynced() {
+		const data = (await this.loadData()) ?? {};
+		await this.saveData(Object.assign({}, data, { lastSynced: this.lastSynced }));
+	}
+	hasCredentials(): boolean {
+		return !!(this.settings?.clientId && this.settings?.clientSecret && this.settings?.refreshToken);
+	}
+
+	errMsg(e: unknown): string {
+		if (!e) return "Unknown error (empty)";
+		if (typeof e === "string") return e;
+		if (e instanceof Error) return e.message || e.toString();
+		try { const s = JSON.stringify(e); if (s && s !== "{}") return s; } catch (_) {}
+		return String(e) || "Unknown error";
+	}
+
+	setStatus(state: "idle" | "syncing" | "error" | "done", extra?: string) {
+		try {
+			if (!this.statusBarEl) return;
+			const msgs: Record<string, string> = { idle: "⏸ GDrive Sync idle", syncing: "🔄 Syncing...", error: "❌ Sync failed" };
+			this.statusBarEl.setText(extra ?? msgs[state] ?? "⏸ GDrive Sync");
+		} catch (_) {}
+	}
+
+	private arrayBufferToBase64(buffer: ArrayBuffer): string {
+		const bytes = new Uint8Array(buffer);
+		let binary = "";
+		for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+		return btoa(binary);
+	}
+
+	private async runInBatches<T>(items: T[], batchSize: number, fn: (item: T) => Promise<void>): Promise<void> {
+		for (let i = 0; i < items.length; i += batchSize) {
+			await Promise.all(items.slice(i, i + batchSize).map(fn));
+		}
+	}
+
+	private async getAccessToken(): Promise<string> {
+		const now = Date.now();
+		if (this.accessToken && now < this.tokenExpiry - 60_000) return this.accessToken;
+		try {
+			const resp = await requestUrl({
+				url: "https://oauth2.googleapis.com/token",
+				method: "POST",
+				headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({
+					client_id: this.settings.clientId,
+					client_secret: this.settings.clientSecret,
+					refresh_token: this.settings.refreshToken,
+					grant_type: "refresh_token",
+				}).toString(),
+			});
+			if (resp.status >= 400) throw new Error(`Token refresh failed (${resp.status}): ${resp.text || JSON.stringify(resp.json)}`);
+			this.accessToken = resp.json.access_token;
+			this.tokenExpiry = now + resp.json.expires_in * 1000;
+			return this.accessToken;
+		} catch (e) {
+			const msg = this.errMsg(e);
+			new Notice(`[GDrive Sync] Token error: ${msg}`, 10000);
+			throw new Error(msg);
+		}
+	}
+
+	private async getFolderId(): Promise<string> {
+		if (this.driveFolderId) return this.driveFolderId;
+		const token = await this.getAccessToken();
+		const folderName = this.settings.driveFolderName;
+		const searchResp = await requestUrl({
+			url: `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`name='${folderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`)}&fields=files(id,name)`,
+			method: "GET",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		if (searchResp.status >= 400) throw new Error(`Folder search failed (${searchResp.status}): ${searchResp.text}`);
+		const files = searchResp.json.files as { id: string; name: string }[];
+		if (files && files.length > 0) { this.driveFolderId = files[0].id; return this.driveFolderId; }
+		const createResp = await requestUrl({
+			url: "https://www.googleapis.com/drive/v3/files",
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ name: folderName, mimeType: "application/vnd.google-apps.folder" }),
+		});
+		if (createResp.status >= 400) throw new Error(`Folder create failed (${createResp.status}): ${createResp.text}`);
+		this.driveFolderId = createResp.json.id;
+		return this.driveFolderId;
+	}
+
+	private encodePath(p: string): string { return p.split("/").join("___"); }
+	private decodePath(p: string): string { return p.split("___").join("/"); }
+
+	private async listDriveFiles(): Promise<Record<string, DriveFileInfo>> {
+		const token = await this.getAccessToken();
+		const folderId = await this.getFolderId();
+		const map: Record<string, DriveFileInfo> = {};
+		let pageToken = "";
+		do {
+			const qParams = new URLSearchParams({
+				q: `'${folderId}' in parents and trashed=false`,
+				fields: "nextPageToken,files(id,name,modifiedTime)",
+				pageSize: "1000",
+			});
+			if (pageToken) qParams.set("pageToken", pageToken);
+			const resp = await requestUrl({
+				url: `https://www.googleapis.com/drive/v3/files?${qParams.toString()}`,
+				method: "GET",
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			if (resp.status >= 400) throw new Error(`Drive list failed (${resp.status}): ${resp.text}`);
+			for (const f of (resp.json.files as { id: string; name: string; modifiedTime: string }[])) {
+				map[this.decodePath(f.name)] = { id: f.id, modifiedTime: f.modifiedTime };
+			}
+			pageToken = resp.json.nextPageToken || "";
+		} while (pageToken);
+		return map;
+	}
+
+	private async downloadFile(fileId: string, vaultPath: string): Promise<void> {
+		const token = await this.getAccessToken();
+		const resp = await requestUrl({
+			url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+			method: "GET",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		if (resp.status >= 400) throw new Error(`Download failed (${resp.status}): ${resp.text}`);
+		const folder = vaultPath.includes("/") ? vaultPath.substring(0, vaultPath.lastIndexOf("/")) : "";
+		if (folder) { try { await this.app.vault.createFolder(folder); } catch (_) {} }
+		const existing = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (existing instanceof TFile) {
+			await this.app.vault.modifyBinary(existing, resp.arrayBuffer);
+		} else {
+			await this.app.vault.createBinary(vaultPath, resp.arrayBuffer);
+		}
+	}
+
+	private async uploadFile(file: TFile, existingDriveId?: string): Promise<void> {
+		const token = await this.getAccessToken();
+		const folderId = await this.getFolderId();
+		const driveName = this.encodePath(file.path);
+		const content = await this.app.vault.readBinary(file);
+		const boundary = "gdrive_boundary_" + Math.random().toString(36).slice(2);
+		const metadata = JSON.stringify(
+			existingDriveId ? { name: driveName } : { name: driveName, parents: [folderId] }
+		);
+		const base64Content = this.arrayBufferToBase64(content);
+		const bodyStr =
+			`--${boundary}\r\n` +
+			`Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+			`${metadata}\r\n` +
+			`--${boundary}\r\n` +
+			`Content-Type: application/octet-stream\r\n` +
+			`Content-Transfer-Encoding: base64\r\n\r\n` +
+			`${base64Content}\r\n` +
+			`--${boundary}--`;
+		const reqParams: RequestUrlParam = {
+			url: existingDriveId
+				? `https://www.googleapis.com/upload/drive/v3/files/${existingDriveId}?uploadType=multipart`
+				: `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`,
+			method: existingDriveId ? "PATCH" : "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": `multipart/related; boundary=${boundary}`,
+			},
+			body: bodyStr,
+		};
+		const resp = await requestUrl(reqParams);
+		if (resp.status >= 400) throw new Error(`Upload failed (${resp.status}): ${resp.text}`);
+		this.lastSynced[file.path] = file.stat.mtime;
+	}
+
+	private async deleteDriveFile(fileId: string): Promise<void> {
+		const token = await this.getAccessToken();
+		const resp = await requestUrl({
+			url: `https://www.googleapis.com/drive/v3/files/${fileId}`,
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		if (resp.status >= 400 && resp.status !== 404) throw new Error(`Delete failed (${resp.status}): ${resp.text}`);
+	}
+
+	async fullTwoWaySync(): Promise<void> {
+		try {
+			if (this.isSyncing) { new Notice("[GDrive Sync] Sync already in progress."); return; }
+			if (!this.hasCredentials()) { new Notice("[GDrive Sync] Please configure credentials in settings."); return; }
+			this.isSyncing = true;
+			this.setStatus("syncing");
+			let downloaded = 0, uploaded = 0;
+			try {
+				const driveMap = await this.listDriveFiles();
+				const toDownload: { id: string; vaultPath: string }[] = [];
+				for (const [vaultPath, info] of Object.entries(driveMap)) {
+					const localFile = this.app.vault.getAbstractFileByPath(vaultPath) as TFile | null;
+					const driveMs = new Date(info.modifiedTime).getTime();
+					if (!localFile || (localFile instanceof TFile && driveMs > localFile.stat.mtime))
+						toDownload.push({ id: info.id, vaultPath });
+				}
+				await this.runInBatches(toDownload, 3, async ({ id, vaultPath }) => {
+					try { await this.downloadFile(id, vaultPath); downloaded++; this.setStatus("syncing", `⬇️ ${downloaded}...`); }
+					catch (e) { console.error(`[GDrive Sync] Download error ${vaultPath}:`, this.errMsg(e)); }
+				});
+				const toUpload: { file: TFile; existingId?: string }[] = [];
+				for (const file of this.app.vault.getFiles()) {
+					const driveInfo = driveMap[file.path];
+					const driveMs = driveInfo ? new Date(driveInfo.modifiedTime).getTime() : 0;
+					const lastSyncedMs = this.lastSynced[file.path] ?? 0;
+					if (!driveInfo || (file.stat.mtime > driveMs && file.stat.mtime > lastSyncedMs))
+						toUpload.push({ file, existingId: driveInfo?.id });
+				}
+				await this.runInBatches(toUpload, 3, async ({ file, existingId }) => {
+					try { await this.uploadFile(file, existingId); uploaded++; this.setStatus("syncing", `⬆️ ${uploaded}...`); }
+					catch (e) { console.error(`[GDrive Sync] Upload error ${file.path}:`, this.errMsg(e)); }
+				});
+				await this.persistLastSynced();
+				this.setStatus("done", `✅ ⬇${downloaded} ⬆${uploaded} — ${new Date().toLocaleTimeString()}`);
+			} catch (e) {
+				const msg = this.errMsg(e);
+				console.error("[GDrive Sync] Sync error:", msg);
+				new Notice(`[GDrive Sync] Sync failed: ${msg}`, 8000);
+				this.setStatus("error");
+			} finally {
+				this.isSyncing = false;
+			}
+		} catch (e) {
+			this.isSyncing = false;
+			console.error("[GDrive Sync] Unexpected crash:", this.errMsg(e));
+			new Notice(`[GDrive Sync] Unexpected error: ${this.errMsg(e)}`, 8000);
+			this.setStatus("error");
+		}
+	}
+
+	async downloadAllFromDrive(): Promise<void> {
+		try {
+			if (this.isSyncing) { new Notice("[GDrive Sync] Sync already in progress."); return; }
+			if (!this.hasCredentials()) { new Notice("[GDrive Sync] Please configure credentials in settings."); return; }
+			this.isSyncing = true;
+			this.setStatus("syncing");
+			const driveMap = await this.listDriveFiles();
+			const entries = Object.entries(driveMap);
+			let count = 0;
+			await this.runInBatches(entries, 3, async ([vaultPath, info]) => {
+				try { await this.downloadFile(info.id, vaultPath); count++; this.setStatus("syncing", `⬇️ ${count}/${entries.length}...`); }
+				catch (e) { console.error(`[GDrive Sync] Download error ${vaultPath}:`, this.errMsg(e)); }
+			});
+			this.setStatus("done", `✅ ⬇${count} — ${new Date().toLocaleTimeString()}`);
+			new Notice(`[GDrive Sync] Downloaded ${count} files.`);
+		} catch (e) {
+			new Notice(`[GDrive Sync] Download failed: ${this.errMsg(e)}`, 8000);
+			this.setStatus("error");
+		} finally {
+			this.isSyncing = false;
+		}
+	}
+
+	startAutoSync() {
+		this.stopAutoSync();
+		this.fullTwoWaySync();
+		this.syncIntervalId = window.setInterval(() => {
+			if (!this.isSyncing) this.fullTwoWaySync();
+		}, this.settings.autoSyncInterval * 1000);
+		new Notice(`[GDrive Sync] Auto-sync started (every ${this.settings.autoSyncInterval}s)`);
+	}
+
+	stopAutoSync() {
+		if (this.syncIntervalId !== null) { window.clearInterval(this.syncIntervalId); this.syncIntervalId = null; }
+		this.setStatus("idle");
+	}
+
+	private async onFileModified(file: TFile) {
+		try {
+			if (file.stat.mtime - (this.lastSynced[file.path] ?? 0) < 2000) return;
+			const driveMap = await this.listDriveFiles();
+			await this.uploadFile(file, driveMap[file.path]?.id);
+		} catch (e) { console.error(`[GDrive Sync] Modify failed ${file.path}:`, this.errMsg(e)); }
+	}
+
+	private async onFileCreated(file: TFile) {
+		try {
+			await new Promise(r => window.setTimeout(r, 1000));
+			await this.uploadFile(file, undefined);
+		} catch (e) { console.error(`[GDrive Sync] Create failed ${file.path}:`, this.errMsg(e)); }
+	}
+
+	private async onFileDeleted(file: TFile) {
+		try {
+			const driveMap = await this.listDriveFiles();
+			const info = driveMap[file.path];
+			if (info) await this.deleteDriveFile(info.id);
+			delete this.lastSynced[file.path];
+		} catch (e) { console.error(`[GDrive Sync] Delete failed ${file.path}:`, this.errMsg(e)); }
+	}
+
+	private async onFileRenamed(file: TFile, oldPath: string) {
+		try {
+			const driveMap = await this.listDriveFiles();
+			const oldInfo = driveMap[oldPath];
+			if (oldInfo) await this.deleteDriveFile(oldInfo.id);
+			delete this.lastSynced[oldPath];
+			await this.uploadFile(file, undefined);
+		} catch (e) { console.error(`[GDrive Sync] Rename failed ${file.path}:`, this.errMsg(e)); }
+	}
+
+	private async silentUpdateCheck(): Promise<void> {
+		try {
+			const base = "https://raw.githubusercontent.com/JanakaProjects/gdrive-vault-sync/main";
+			const mResp = await requestUrl({ url: `${base}/manifest.json`, method: "GET" });
+			if (mResp.status >= 400) return;
+			const remoteVer = mResp.json?.version;
+			const localVer = this.manifest?.version;
+			if (!remoteVer || !localVer || remoteVer === localVer) return;
+			new Notice(`[GDrive Sync] Update v${localVer} → v${remoteVer}. Updating...`);
+			const jsResp = await requestUrl({ url: `${base}/main.js`, method: "GET" });
+			if (jsResp.status >= 400) { new Notice(`[GDrive Sync] Update failed: could not fetch main.js`, 8000); return; }
+			const dir = `.obsidian/plugins/gdrive-vault-sync`;
+			await this.app.vault.adapter.write(`${dir}/main.js`, jsResp.text);
+			await this.app.vault.adapter.write(`${dir}/manifest.json`, JSON.stringify(mResp.json, null, 2));
+			new Notice(`[GDrive Sync] Updated to v${remoteVer}! Reloading...`);
+			// @ts-ignore
+			await this.app.plugins.disablePlugin("gdrive-vault-sync");
+			// @ts-ignore
+			await this.app.plugins.enablePlugin("gdrive-vault-sync");
+		} catch (e) { console.warn("[GDrive Sync] Silent update check failed:", this.errMsg(e)); }
+	}
+
+	async checkForUpdate(): Promise<void> {
+		try {
+			const base = "https://raw.githubusercontent.com/JanakaProjects/gdrive-vault-sync/main";
+			const mResp = await requestUrl({ url: `${base}/manifest.json`, method: "GET" });
+			if (mResp.status >= 400) throw new Error(`Failed to fetch manifest: ${mResp.status}`);
+			const remoteVer = mResp.json?.version;
+			const localVer = this.manifest?.version;
+			if (remoteVer === localVer) { new Notice(`[GDrive Sync] Already up to date (v${localVer})`); return; }
+			new Notice(`[GDrive Sync] Updating v${localVer} → v${remoteVer}...`);
+			const jsResp = await requestUrl({ url: `${base}/main.js`, method: "GET" });
+			if (jsResp.status >= 400) throw new Error(`Failed to fetch main.js: ${jsResp.status}`);
+			const dir = `.obsidian/plugins/gdrive-vault-sync`;
+			await this.app.vault.adapter.write(`${dir}/main.js`, jsResp.text);
+			await this.app.vault.adapter.write(`${dir}/manifest.json`, JSON.stringify(mResp.json, null, 2));
+			new Notice(`[GDrive Sync] Update complete! Reloading...`);
+			// @ts-ignore
+			await this.app.plugins.disablePlugin("gdrive-vault-sync");
+			// @ts-ignore
+			await this.app.plugins.enablePlugin("gdrive-vault-sync");
+		} catch (e) { new Notice(`[GDrive Sync] Update check failed: ${this.errMsg(e)}`, 8000); }
+	}
+}
+
+class GDriveSyncSettingTab extends PluginSettingTab {
+	plugin: GDriveVaultSync;
+	constructor(app: App, plugin: GDriveVaultSync) { super(app, plugin); this.plugin = plugin; }
+
+	display(): void {
+		const { containerEl } = this;
+		containerEl.empty();
+		containerEl.createEl("h2", { text: "GDrive Vault Sync — Settings" });
+		new Setting(containerEl).setName("Client ID").setDesc("Google OAuth 2.0 Client ID").addText(t =>
+			t.setPlaceholder("Enter your Client ID").setValue(this.plugin.settings.clientId)
+				.onChange(async v => { this.plugin.settings.clientId = v.trim(); await this.plugin.saveSettings(); }));
+		new Setting(containerEl).setName("Client Secret").setDesc("Google OAuth 2.0 Client Secret").addText(t =>
+			t.setPlaceholder("Enter your Client Secret").setValue(this.plugin.settings.clientSecret)
+				.onChange(async v => { this.plugin.settings.clientSecret = v.trim(); await this.plugin.saveSettings(); }));
+		new Setting(containerEl).setName("Refresh Token").setDesc("Long-lived OAuth 2.0 Refresh Token").addText(t =>
+			t.setPlaceholder("Enter your Refresh Token").setValue(this.plugin.settings.refreshToken)
+				.onChange(async v => { this.plugin.settings.refreshToken = v.trim(); await this.plugin.saveSettings(); }));
+		new Setting(containerEl).setName("Drive Folder Name").setDesc("Folder in Google Drive").addText(t =>
+			t.setPlaceholder("ObsidianVaultSync").setValue(this.plugin.settings.driveFolderName)
+				.onChange(async v => { this.plugin.settings.driveFolderName = v.trim() || "ObsidianVaultSync"; this.plugin["driveFolderId"] = ""; await this.plugin.saveSettings(); }));
+		new Setting(containerEl).setName("Auto-sync interval (seconds)").setDesc("1–300 seconds").addSlider(s =>
+			s.setLimits(1, 300, 1).setValue(this.plugin.settings.autoSyncInterval).setDynamicTooltip()
+				.onChange(async v => { this.plugin.settings.autoSyncInterval = v; await this.plugin.saveSettings(); }));
+		new Setting(containerEl).setName("Auto-sync on open").setDesc("Start syncing when Obsidian opens").addToggle(t =>
+			t.setValue(this.plugin.settings.autoSyncOnStart)
+				.onChange(async v => { this.plugin.settings.autoSyncOnStart = v; await this.plugin.saveSettings(); }));
+		containerEl.createEl("h3", { text: "Actions" });
+		new Setting(containerEl).setName("▶ Start Auto-Sync").setDesc("Begin automatic sync at configured interval")
+			.addButton(b => b.setButtonText("Start").setCta().onClick(() => this.plugin.startAutoSync()));
+		new Setting(containerEl).setName("⏸ Stop Auto-Sync").setDesc("Stop the automatic sync interval")
+			.addButton(b => b.setButtonText("Stop").onClick(() => { this.plugin.stopAutoSync(); new Notice("[GDrive Sync] Auto-sync stopped."); }));
+		new Setting(containerEl).setName("🔄 Two-Way Sync Now").setDesc("Immediately run a full two-way sync")
+			.addButton(b => b.setButtonText("Sync Now").setCta().onClick(() => this.plugin.fullTwoWaySync()));
+		new Setting(containerEl).setName("⬇ Download All from Drive").setDesc("Force-download every file from Google Drive")
+			.addButton(b => b.setButtonText("Download All").onClick(() => this.plugin.downloadAllFromDrive()));
+		new Setting(containerEl).setName("🔄 Check for Update").setDesc("Fetch latest version from GitHub and auto-update")
+			.addButton(b => b.setButtonText("Check Update").onClick(() => this.plugin.checkForUpdate()));
+	}
+}

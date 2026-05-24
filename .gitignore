@@ -1,0 +1,4 @@
+# Dependency directory
+node_modules
+
+# main.js is intentionally tracked (needed for direct download)

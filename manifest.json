@@ -1,0 +1,10 @@
+{
+  "id": "gdrive-vault-sync",
+  "name": "GDrive Vault Sync",
+  "version": "1.0.1",
+  "minAppVersion": "1.0.0",
+  "description": "Two-way sync your Obsidian vault with Google Drive",
+  "author": "JanakaProjects",
+  "authorUrl": "https://github.com/JanakaProjects",
+  "isDesktopOnly": false
+}
